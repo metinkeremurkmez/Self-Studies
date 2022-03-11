@@ -1,0 +1,225 @@
+WITH props AS (
+with max_ts as(
+select user_id, max(event_timestamp) ts
+from (SELECT T2.event_name, T2.event_timestamp, 
+  T2.user_id, T2.geo.sub_continent, T2.geo.country,T2.app_info.version, 
+  T2.device.mobile_brand_name, T2.privacy_info.ads_storage, T2.ecommerce.total_item_quantity
+  FROM b2metric-iq-test.ga_analytic.ga_event_sample T2 WHERE T2.event_name ='screen_view')
+group by 1)
+
+select t1.user_id, sub_continent as geo_sub_continent, country as geo_country,version as app_info_version,
+mobile_brand_name as device_mobile_brand_name, ads_storage as privacy_info_ads_storage
+from (SELECT T2.event_name, T2.event_timestamp, 
+  T2.user_id, T2.geo.sub_continent, T2.geo.country,T2.app_info.version, 
+  T2.device.mobile_brand_name, T2.privacy_info.ads_storage, T2.ecommerce.total_item_quantity
+  FROM b2metric-iq-test.ga_analytic.ga_event_sample T2 WHERE T2.event_name ='screen_view') t1
+inner join max_ts t2 on t1.user_id = t2.user_id and t1.event_timestamp = t2.ts),
+
+ext1 AS (SELECT
+  DISTINCT MDaysUsers.user_id AS n_day_inactive_user_ids,
+  1 as inactive_users_last_7_days
+FROM
+  (
+    SELECT
+      user_id
+    FROM
+      b2metric-iq-test.ga_analytic.ga_event_sample AS T 
+    CROSS JOIN
+      T.event_params
+    WHERE
+      event_params.key = 'engagement_time_msec' AND event_params.value.int_value > 0
+      /* Has engaged in last M = 7 days */
+      AND event_timestamp >
+          UNIX_MICROS(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY))
+  ) AS MDaysUsers
+LEFT JOIN
+  (
+    SELECT
+      user_id
+    FROM
+      b2metric-iq-test.ga_analytic.ga_event_sample AS T 
+    CROSS JOIN
+      T.event_params
+    WHERE
+      event_params.key = 'engagement_time_msec' AND event_params.value.int_value > 0
+      /* Has engaged in last N = 2 days */
+      AND event_timestamp >
+          UNIX_MICROS(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 DAY))
+  ) AS NDaysUsers
+  ON MDaysUsers.user_id = NDaysUsers.user_id
+WHERE
+  NDaysUsers.user_id IS NULL),
+  
+  
+ext2 AS (SELECT
+  DISTINCT user_id AS n_day_active_user_ids,
+  1 as active_users_last_30_days
+FROM
+  b2metric-iq-test.ga_analytic.ga_event_sample AS T 
+    CROSS JOIN
+      T.event_params
+WHERE
+  event_params.key = 'engagement_time_msec' AND event_params.value.int_value > 0
+  -- Pick events in the last N = 30 days.
+  AND event_timestamp >
+      UNIX_MICROS(TIMESTAMP_SUB(CURRENT_TIMESTAMP, INTERVAL 30 DAY))),
+
+ext3 AS (SELECT
+  DISTINCT user_id AS frequent_active_user_ids,
+  1 as active_users_2day_at_lastweek
+FROM
+  (
+    SELECT
+      user_id,
+      COUNT(DISTINCT event_date)
+    FROM
+      b2metric-iq-test.ga_analytic.ga_event_sample AS T 
+    CROSS JOIN
+      T.event_params
+    WHERE
+      event_params.key = 'engagement_time_msec' AND event_params.value.int_value > 0
+      -- User engagement in the last M = 7 days.
+      AND event_timestamp >
+          UNIX_MICROS(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY))
+    GROUP BY 1
+    -- Having engaged in at least N = 2  days.
+    HAVING COUNT(event_date) >= 2 
+  )),
+
+
+ext4 AS (SELECT
+  DISTINCT user_id AS high_active_user_ids,
+  1 as high_active_users_last_5min_at_10day
+FROM
+  (
+    SELECT
+      user_id,
+      event_params.key,
+      SUM(event_params.value.int_value)
+    FROM
+      b2metric-iq-test.ga_analytic.ga_event_sample AS T 
+    CROSS JOIN
+      T.event_params
+    WHERE
+      -- User engagement in the last M = 10 days.
+      event_timestamp >
+          UNIX_MICROS(TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 10 DAY))
+      AND event_params.key = 'engagement_time_msec'
+    GROUP BY 1, 2
+    HAVING
+      -- Having engaged for more than N = 5 minutes.
+      SUM(event_params.value.int_value) > 5 * 60 * 1000000
+  ))
+
+SELECT 
+DISTINCT T.user_id, high_active_users_last_5min_at_10day, active_users_2day_at_lastweek, active_users_last_30_days, inactive_users_last_7_days, 
+geo_sub_continent,	geo_country,	app_info_version,	device_mobile_brand_name,	privacy_info_ads_storage,	
+
+SUM((CASE
+WHEN T.event_name = "app_remove" THEN (1)
+ELSE
+0
+END)) OVER(PARTITION BY T.user_id) as app_remove,
+
+COUNT(DISTINCT(CASE
+WHEN T.event_name is not null THEN (T.event_date)
+END)) OVER(PARTITION BY T.user_id) as discrete_event_days,
+
+SUM((CASE
+WHEN T.event_name is not null THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) / COUNT(DISTINCT(CASE
+WHEN T.event_name is not null THEN (T.event_date)
+END)) OVER(PARTITION BY T.user_id) as events_per_day,
+
+COUNT(DISTINCT T.event_name) OVER(PARTITION BY (T.user_id)) as distinct_event_types,
+
+SUM((CASE
+WHEN T.event_name is not null THEN (1)
+ELSE 0
+END)) OVER(PARTITION BY T.user_id) as event_count,
+
+SUM((CASE
+WHEN T.event_timestamp > 0 THEN (T.event_timestamp - T.event_previous_timestamp)
+ELSE 0
+END)) OVER(PARTITION BY T.user_id) as usage_range_timestamp,
+
+(SUM((CASE
+WHEN T.event_timestamp > 0 THEN (T.event_timestamp - T.event_previous_timestamp)
+ELSE 0
+END)) OVER(PARTITION BY T.user_id) / SUM((CASE
+WHEN T.event_name is not null THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id)) as event_traffic_freq,
+
+SUM((CASE
+WHEN T.event_name = "user_engagement" THEN ( SELECT value.int_value FROM UNNEST(T.event_params) WHERE key = "engagement_time_msec")
+ELSE 0
+END)) OVER(PARTITION BY T.user_id) as user_engagement_millisec,
+
+SUM((CASE
+WHEN T.event_name = "screen_view" THEN ( SELECT value.int_value FROM UNNEST(T.event_params) WHERE key = "engagement_time_msec")
+ELSE 0
+END)) OVER(PARTITION BY T.user_id) as screen_engagement_time_msec,
+
+SUM((CASE
+WHEN T.event_name = "app_exception" THEN ( SELECT value.int_value FROM UNNEST(T.event_params) WHERE key = "engagement_time_msec")
+ELSE 0
+END)) OVER(PARTITION BY T.user_id) as crash_engagement_time_msec,
+
+SUM((CASE
+WHEN T.event_name  = "session_start" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as session_start_count,
+
+SUM((CASE
+WHEN T.event_name = "app_clear_data" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as app_clear_count,
+
+SUM((CASE
+WHEN T.event_name = "app_update" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as app_update_count,
+
+SUM((CASE
+WHEN T.event_name = "os_update" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as os_update_count,
+
+COUNT(DISTINCT(CASE
+WHEN T.event_name = "app_exception" THEN ( SELECT value.string_value FROM UNNEST(T.event_params) WHERE key = "fatal")
+END)) OVER(PARTITION BY T.user_id) as distinct_fatal_count,
+
+COUNT(DISTINCT(CASE
+WHEN T.event_name = "firebase_campaign" THEN ( SELECT value.string_value FROM UNNEST(T.event_params) WHERE key = "content")
+END)) OVER(PARTITION BY T.user_id) as distinct_campaign_count,
+
+COUNT(DISTINCT(CASE
+WHEN T.event_name = "notification_foreground" THEN ( SELECT value.string_value FROM UNNEST(T.event_params) WHERE key = "mesasage_id")
+END)) OVER(PARTITION BY T.user_id) as distinct_notification_foreground_count,
+
+COUNT(DISTINCT(CASE
+WHEN T.event_name = "notification_dismiss" THEN ( SELECT value.string_value FROM UNNEST(T.event_params) WHERE key = "mesasage_id")
+END)) OVER(PARTITION BY T.user_id) as distinct_notification_dismiss_count,
+
+COUNT(DISTINCT(CASE
+WHEN T.event_name = "notification_open" THEN ( SELECT value.string_value FROM UNNEST(T.event_params) WHERE key = "mesasage_id")
+END)) OVER(PARTITION BY T.user_id) as distinct_notification_open_count,
+
+COUNT(DISTINCT(CASE
+WHEN event_name = "notification_receive" THEN ( SELECT value.string_value FROM UNNEST(event_params) WHERE key = "mesasage_id")
+END)) OVER(PARTITION BY T.user_id) as distinct_notification_receive_count,
+
+SUM((CASE
+WHEN T.event_name = "firebase_campaign" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as campaign_count,
+
+SUM((CASE
+WHEN T.event_name = "notification_foreground" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as notif_foreground_count,
+
+SUM((CASE
+WHEN T.event_name = "notification_dismiss" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as notif_dismiss_count,
+
+SUM((CASE
+WHEN T.event_name = "notification_open" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as notif_open_count,
+
+SUM((CASE
+WHEN T.event_name = "notification_receive" THEN 1 ELSE 0 END)) OVER(PARTITION BY T.user_id) as notif_receive_count,
+
+COUNT(DISTINCT T.device.mobile_brand_name) OVER(PARTITION BY T.user_id) as distinct_mobile_brand_name,
+
+FROM b2metric-iq-test.ga_analytic.ga_event_sample as T 
+
+LEFT JOIN ext1 ON T.user_id = ext1.n_day_inactive_user_ids 
+LEFT JOIN ext2 ON T.user_id = ext2.n_day_active_user_ids
+LEFT JOIN ext3 ON T.user_id = ext3.frequent_active_user_ids
+LEFT JOIN ext4 ON T.user_id = ext4.high_active_user_ids
+LEFT JOIN props ON T.user_id = props.user_id;
